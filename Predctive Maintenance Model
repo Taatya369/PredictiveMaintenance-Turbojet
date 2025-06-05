@@ -1,0 +1,161 @@
+### Predctive Maintenance Model ###
+
+# --- Install Dependencies ---
+!pip install streamlit shap keras-tuner
+
+# --- Imports ---
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (Input, Conv1D, LSTM, Bidirectional, Dense,
+                                     Dropout, MultiHeadAttention, LayerNormalization,
+                                     GlobalAveragePooling1D, Add)
+from tensorflow.keras.callbacks import EarlyStopping
+import shap
+import io
+
+# --- Load Data ---
+try:
+    from google.colab import files
+    uploaded = files.upload()
+    file_key = list(uploaded.keys())[0]
+    df = pd.read_csv(io.BytesIO(uploaded[file_key]))
+except:
+    df = pd.read_csv("CMAPSS_combined_preprocessed_with_RUL.csv")
+
+# --- Preserve 'unit_number' before dropping
+unit_ids = df['unit_number']
+
+# Drop unnecessary columns
+id_cols = ['unit_number', 'time_in_cycles', 'dataset_id']
+constant_sensors = ['sensor_measurement_1', 'sensor_measurement_5', 'sensor_measurement_10']
+df.drop(columns=id_cols + constant_sensors, inplace=True)
+
+# Preprocessing
+features = df.drop(columns=['RUL'])
+target_rul = df['RUL']
+scaler = MinMaxScaler()
+features_scaled = pd.DataFrame(scaler.fit_transform(features), columns=features.columns)
+features_scaled['RUL'] = target_rul
+features_scaled['failure_within_30'] = features_scaled['RUL'].apply(lambda x: 1 if x <= 30 else 0)
+
+# ✅ Restore 'unit_number'
+features_scaled['unit_number'] = unit_ids
+
+# --- Sequence Construction ---
+def generate_sequences(df, lookback=40):
+    sequences, rul_targets, fail_targets = [], [], []
+    for _, unit_df in df.groupby('unit_number'):
+        unit_df = unit_df.reset_index(drop=True)
+        for i in range(lookback, len(unit_df)):
+            seq = unit_df.iloc[i - lookback:i]
+            sequences.append(seq.drop(columns=['RUL', 'failure_within_30', 'unit_number']).values)
+            rul_targets.append(unit_df.loc[i, 'RUL'])
+            fail_targets.append(unit_df.loc[i, 'failure_within_30'])
+    return np.array(sequences), np.array(rul_targets), np.array(fail_targets)
+
+X, y_rul, y_class = generate_sequences(features_scaled, lookback=40)
+X_train, X_test, y_train_rul, y_test_rul = train_test_split(X, y_rul, test_size=0.2, random_state=42)
+_, _, y_train_clf, y_test_clf = train_test_split(X, y_class, test_size=0.2, random_state=42)
+
+# --- Model Architecture ---
+def build_model(input_shape):
+    inputs = Input(shape=input_shape)
+    x = Conv1D(64, kernel_size=3, activation='relu')(inputs)
+    x = Bidirectional(LSTM(64, return_sequences=True))(x)
+    attn_output = MultiHeadAttention(num_heads=2, key_dim=32)(x, x)
+    x = Add()([x, attn_output])
+    x = LayerNormalization()(x)
+    x = GlobalAveragePooling1D()(x)
+    x = Dropout(0.3)(x)
+    x = Dense(64, activation='relu')(x)
+
+    reg_out = Dense(1, name='rul')(x)                       # RUL Regression Head
+    clf_out = Dense(1, activation='sigmoid', name='fail30')(x)  # Binary Classification Head
+    model = Model(inputs=inputs, outputs=[reg_out, clf_out])
+
+    model.compile(optimizer='adam',
+                  loss={'rul': 'mse', 'fail30': 'binary_crossentropy'},
+                  loss_weights={'rul': 0.6, 'fail30': 0.4},
+                  metrics={'rul': 'mae', 'fail30': 'accuracy'})
+    return model
+
+
+model = build_model(X_train.shape[1:])
+early_stop = EarlyStopping(patience=10, restore_best_weights=True)
+model.fit(X_train, {'rul': y_train_rul, 'fail30': y_train_clf},
+          validation_split=0.2,
+          epochs=30,
+          batch_size=64,
+          callbacks=[early_stop])
+
+# --- Evaluate Model ---
+from sklearn.metrics import mean_squared_error, confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc
+
+# Predict RUL on test set
+y_pred_rul, y_pred_fail_prob = model.predict(X_test)
+y_pred_rul = y_pred_rul.flatten()
+y_pred_fail_bin = (y_pred_fail_prob.flatten() > 0.5).astype(int)
+
+
+# Compute RMSE and MAE
+rmse = np.sqrt(mean_squared_error(y_test_rul, y_pred_rul))
+mae = np.mean(np.abs(y_test_rul - y_pred_rul))
+print(f"Test RMSE: {rmse:.2f}")
+print(f"Test MAE: {mae:.2f}")
+
+# --- Plot Predicted vs Actual RUL ---
+plt.figure(figsize=(10, 5))
+plt.plot(y_test_rul[:100], label='Actual RUL')
+plt.plot(y_pred_rul[:100], label='Predicted RUL')
+plt.xlabel('Sample Index')
+plt.ylabel('RUL')
+plt.title('Predicted vs Actual RUL (First 100 samples)')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+_, y_class_test = train_test_split(y_class, test_size=0.2, random_state=42)
+y_true_bin = (y_test_rul <= 30).astype(int)
+y_pred_bin = (y_pred_rul <= 30).astype(int)
+
+# ROC and Confusion Matrix
+fpr, tpr, _ = roc_curve(y_true_bin, -y_pred_rul)  # Try inverting the score
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(6, 6))
+plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.2f}")
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve')
+plt.legend()
+plt.grid()
+plt.show()
+
+cm = confusion_matrix(y_true_bin, y_pred_bin)
+ConfusionMatrixDisplay(cm, display_labels=["No Failure", "Failure"]).plot(cmap='Blues')
+plt.title("Confusion Matrix")
+plt.show()
+
+def simulate_downtime_binary(y_true_rul, y_pred_fail_prob, threshold=0.5):
+    y_pred_bin = (y_pred_fail_prob > threshold).astype(int)
+    y_true_fail = (y_true_rul <= 35).astype(int)
+
+    baseline_downtime = np.sum(y_true_fail)
+    predicted_downtime = np.sum((y_pred_bin == 1) & (y_true_fail == 1))
+    avoided_downtime = baseline_downtime - predicted_downtime
+    reduction = (avoided_downtime / baseline_downtime) * 100 if baseline_downtime > 0 else 0
+
+    print(f"Baseline Downtime Events: {baseline_downtime}")
+    print(f"Predicted Downtime Events: {predicted_downtime}")
+    print(f"Avoided Downtime Events: {avoided_downtime}")
+    print(f"Estimated Downtime Reduction: {reduction:.2f}%")
+    return reduction
+_, y_pred_prob = model.predict(X_test)
+simulate_downtime_binary(y_test_rul, y_pred_prob.flatten())
